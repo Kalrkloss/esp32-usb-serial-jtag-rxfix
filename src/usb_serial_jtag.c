@@ -35,6 +35,10 @@ typedef struct {
 
     // RX parameters
     RingbufHandle_t rx_ring_buf;        /*!< RX ring buffer handler */
+    uint8_t rx_stash_buf[USB_SER_JTAG_RX_MAX_SIZE];
+    size_t rx_stash_len;
+    bool rx_stash_busy;
+    portMUX_TYPE rx_stash_mux;
 
     // TX parameters
     RingbufHandle_t tx_ring_buf;        /*!< TX ring buffer handler */
@@ -51,6 +55,34 @@ typedef struct {
 static usb_serial_jtag_obj_t *p_usb_serial_jtag_obj = NULL;
 
 static const char* USB_SERIAL_JTAG_TAG = "usb_serial_jtag";
+
+static void usb_serial_jtag_rx_flush_stash(void)
+{
+    uint8_t buf[USB_SER_JTAG_RX_MAX_SIZE];
+    size_t len;
+
+    portENTER_CRITICAL(&p_usb_serial_jtag_obj->rx_stash_mux);
+    if (p_usb_serial_jtag_obj->rx_stash_len == 0 || p_usb_serial_jtag_obj->rx_stash_busy) {
+        portEXIT_CRITICAL(&p_usb_serial_jtag_obj->rx_stash_mux);
+        return;
+    }
+    p_usb_serial_jtag_obj->rx_stash_busy = true;
+    len = p_usb_serial_jtag_obj->rx_stash_len;
+    memcpy(buf, p_usb_serial_jtag_obj->rx_stash_buf, len);
+    portEXIT_CRITICAL(&p_usb_serial_jtag_obj->rx_stash_mux);
+
+    if (xRingbufferSend(p_usb_serial_jtag_obj->rx_ring_buf, buf, len, 0) == pdTRUE) {
+        portENTER_CRITICAL(&p_usb_serial_jtag_obj->rx_stash_mux);
+        p_usb_serial_jtag_obj->rx_stash_len = 0;
+        p_usb_serial_jtag_obj->rx_stash_busy = false;
+        usb_serial_jtag_ll_ena_intr_mask(USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT);
+        portEXIT_CRITICAL(&p_usb_serial_jtag_obj->rx_stash_mux);
+    } else {
+        portENTER_CRITICAL(&p_usb_serial_jtag_obj->rx_stash_mux);
+        p_usb_serial_jtag_obj->rx_stash_busy = false;
+        portEXIT_CRITICAL(&p_usb_serial_jtag_obj->rx_stash_mux);
+    }
+}
 
 static void usb_serial_jtag_isr_handler_default(void *arg)
 {
@@ -136,15 +168,27 @@ static void usb_serial_jtag_isr_handler_default(void *arg)
     }
 
     if (usbjtag_intr_status & USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT) {
-        // Acknowledge interrupt
-        usb_serial_jtag_ll_clr_intsts_mask(USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT);
-        // Read RX FIFO and send available data to ringbuffer.
-        uint8_t buf[USB_SER_JTAG_RX_MAX_SIZE];
-        uint32_t rx_fifo_len = usb_serial_jtag_ll_read_rxfifo(buf, USB_SER_JTAG_RX_MAX_SIZE);
-        xRingbufferSendFromISR(p_usb_serial_jtag_obj->rx_ring_buf, buf, rx_fifo_len, &xTaskWoken);
+        bool can_read_rx_fifo;
+        portENTER_CRITICAL_ISR(&p_usb_serial_jtag_obj->rx_stash_mux);
+        can_read_rx_fifo = p_usb_serial_jtag_obj->rx_stash_len == 0 && !p_usb_serial_jtag_obj->rx_stash_busy;
+        portEXIT_CRITICAL_ISR(&p_usb_serial_jtag_obj->rx_stash_mux);
 
-        if (p_usb_serial_jtag_obj->usj_select_notif_callback) {
-            p_usb_serial_jtag_obj->usj_select_notif_callback(USJ_SELECT_READ_NOTIF, &xTaskWoken);
+        if (can_read_rx_fifo) {
+            usb_serial_jtag_ll_clr_intsts_mask(USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT);
+            uint8_t buf[USB_SER_JTAG_RX_MAX_SIZE];
+            uint32_t rx_fifo_len = usb_serial_jtag_ll_read_rxfifo(buf, USB_SER_JTAG_RX_MAX_SIZE);
+            if (rx_fifo_len > 0 &&
+                    xRingbufferSendFromISR(p_usb_serial_jtag_obj->rx_ring_buf, buf, rx_fifo_len, &xTaskWoken) != pdTRUE) {
+                portENTER_CRITICAL_ISR(&p_usb_serial_jtag_obj->rx_stash_mux);
+                memcpy(p_usb_serial_jtag_obj->rx_stash_buf, buf, rx_fifo_len);
+                p_usb_serial_jtag_obj->rx_stash_len = rx_fifo_len;
+                usb_serial_jtag_ll_disable_intr_mask(USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT);
+                portEXIT_CRITICAL_ISR(&p_usb_serial_jtag_obj->rx_stash_mux);
+            }
+
+            if (rx_fifo_len > 0 && p_usb_serial_jtag_obj->usj_select_notif_callback) {
+                p_usb_serial_jtag_obj->usj_select_notif_callback(USJ_SELECT_READ_NOTIF, &xTaskWoken);
+            }
         }
     }
 
@@ -158,7 +202,8 @@ esp_err_t usb_serial_jtag_driver_install(usb_serial_jtag_driver_config_t *usb_se
     esp_err_t err = ESP_OK;
     ESP_RETURN_ON_FALSE((p_usb_serial_jtag_obj == NULL), ESP_ERR_INVALID_STATE, USB_SERIAL_JTAG_TAG, "Driver already installed");
     ESP_RETURN_ON_FALSE((usb_serial_jtag_config->rx_buffer_size > 0), ESP_ERR_INVALID_ARG, USB_SERIAL_JTAG_TAG, "RX buffer is not prepared");
-    ESP_RETURN_ON_FALSE((usb_serial_jtag_config->rx_buffer_size > USB_SER_JTAG_RX_MAX_SIZE), ESP_ERR_INVALID_ARG, USB_SERIAL_JTAG_TAG, "RX buffer prepared is so small, should larger than 64");
+    ESP_RETURN_ON_FALSE((usb_serial_jtag_config->rx_buffer_size > USB_SER_JTAG_RX_MAX_SIZE), ESP_ERR_INVALID_ARG,
+                        USB_SERIAL_JTAG_TAG, "RX buffer prepared is so small, should larger than 64");
     ESP_RETURN_ON_FALSE((usb_serial_jtag_config->tx_buffer_size > 0), ESP_ERR_INVALID_ARG, USB_SERIAL_JTAG_TAG, "TX buffer is not prepared");
     p_usb_serial_jtag_obj = (usb_serial_jtag_obj_t*) heap_caps_calloc(1, sizeof(usb_serial_jtag_obj_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (p_usb_serial_jtag_obj == NULL) {
@@ -168,6 +213,7 @@ esp_err_t usb_serial_jtag_driver_install(usb_serial_jtag_driver_config_t *usb_se
         return ESP_ERR_NO_MEM;
     }
     p_usb_serial_jtag_obj->tx_stash_cnt = 0;
+    portMUX_INITIALIZE(&p_usb_serial_jtag_obj->rx_stash_mux);
 
     p_usb_serial_jtag_obj->rx_ring_buf = xRingbufferCreate(usb_serial_jtag_config->rx_buffer_size, RINGBUF_TYPE_BYTEBUF);
     if (p_usb_serial_jtag_obj->rx_ring_buf == NULL) {
@@ -242,16 +288,20 @@ int usb_serial_jtag_read_bytes(void* buf, uint32_t length, uint32_t ticks_to_wai
         return 0;
     }
 
-    // Receive new data from ISR
-    data = (uint8_t*) xRingbufferReceiveUpTo(p_usb_serial_jtag_obj->rx_ring_buf, &data_read_len, (TickType_t) ticks_to_wait, length);
+    data = (uint8_t*) xRingbufferReceiveUpTo(p_usb_serial_jtag_obj->rx_ring_buf, &data_read_len, 0, length);
     if (data == NULL) {
-        // If there is no data received from ringbuffer, return 0 directly.
-        return 0;
+        usb_serial_jtag_rx_flush_stash();
+        data = (uint8_t*) xRingbufferReceiveUpTo(p_usb_serial_jtag_obj->rx_ring_buf, &data_read_len,
+                                                 (TickType_t) ticks_to_wait, length);
+        if (data == NULL) {
+            return 0;
+        }
     }
 
     memcpy((uint8_t*)buf, data, data_read_len);
     vRingbufferReturnItem(p_usb_serial_jtag_obj->rx_ring_buf, data);
     data = NULL;
+    usb_serial_jtag_rx_flush_stash();
 
     return data_read_len;
 }
